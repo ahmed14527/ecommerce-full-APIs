@@ -30,6 +30,7 @@ class ProductListSerializer(serializers.ModelSerializer):
     review_count = serializers.ReadOnlyField()
     is_in_stock = serializers.ReadOnlyField()
     discount_percentage = serializers.ReadOnlyField()
+    profit = serializers.ReadOnlyField()        # NEW
 
     class Meta:
         model = Product
@@ -37,6 +38,7 @@ class ProductListSerializer(serializers.ModelSerializer):
             'id', 'name', 'slug', 'category', 'category_name', 'price',
             'compare_at_price', 'discount_percentage', 'is_in_stock',
             'primary_image', 'average_rating', 'review_count', 'is_featured',
+            'cost_price', 'profit_margin', 'profit',                          # NEW
         )
 
     def get_primary_image(self, obj):
@@ -55,6 +57,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     review_count = serializers.ReadOnlyField()
     is_in_stock = serializers.ReadOnlyField()
     discount_percentage = serializers.ReadOnlyField()
+    profit = serializers.ReadOnlyField()        # NEW
 
     class Meta:
         model = Product
@@ -62,9 +65,10 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             'id', 'name', 'slug', 'description', 'category', 'category_name',
             'price', 'compare_at_price', 'discount_percentage', 'stock', 'sku',
             'is_active', 'is_featured', 'is_in_stock', 'weight',
+            'cost_price', 'profit_margin', 'profit',                          # NEW
             'images', 'average_rating', 'review_count', 'created_at', 'updated_at',
         )
-        read_only_fields = ('slug', 'created_at', 'updated_at')
+        read_only_fields = ('slug', 'profit', 'created_at', 'updated_at')     # profit added
 
 
 class ProductWriteSerializer(serializers.ModelSerializer):
@@ -75,4 +79,35 @@ class ProductWriteSerializer(serializers.ModelSerializer):
         fields = (
             'name', 'description', 'category', 'price', 'compare_at_price',
             'stock', 'sku', 'is_active', 'is_featured', 'weight',
+            'cost_price', 'profit_margin',                                    # NEW
         )
+
+    def validate(self, attrs):
+        cost_price    = attrs.get('cost_price')
+        profit_margin = attrs.get('profit_margin')
+        price         = attrs.get('price')
+
+        # profit_margin requires cost_price to be meaningful
+        if profit_margin is not None and cost_price is None:
+            raise serializers.ValidationError({
+                'cost_price': 'cost_price is required when profit_margin is provided.'
+            })
+
+        # Manual price entry: ensure price >= cost_price
+        if price is not None and cost_price is not None and profit_margin is None:
+            if price < cost_price:
+                raise serializers.ValidationError({
+                    'price': (
+                        f'Selling price ({price}) must be >= cost_price ({cost_price}).'
+                    )
+                })
+
+        return attrs
+
+
+# NEW ─────────────────────────────────────────────────────────────────────────
+class MonthlyProfitSerializer(serializers.Serializer):
+    """One row in the monthly profit report."""
+    month         = serializers.CharField(help_text="Format: YYYY-MM  e.g. 2026-04")
+    total_profit  = serializers.DecimalField(max_digits=14, decimal_places=2)
+    product_count = serializers.IntegerField(help_text="Products created that month with cost data")

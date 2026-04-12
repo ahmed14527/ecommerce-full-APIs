@@ -47,6 +47,23 @@ class Product(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    # ── Pricing / profit tracking (NEW) ───────────────────────────────────────
+    cost_price = models.DecimalField(
+        max_digits=10, decimal_places=2,
+        null=True, blank=True,
+        validators=[MinValueValidator(0)],
+        help_text="Cost price before profit. Required for profit tracking.",
+    )
+    profit_margin = models.DecimalField(
+        max_digits=5, decimal_places=2,
+        null=True, blank=True,
+        validators=[MinValueValidator(0)],
+        help_text=(
+            "Optional profit margin %. "
+            "If set, price = cost_price + (cost_price × profit_margin / 100)."
+        ),
+    )
+
     class Meta:
         verbose_name = 'Product'
         verbose_name_plural = 'Products'
@@ -55,14 +72,30 @@ class Product(models.Model):
             models.Index(fields=['slug']),
             models.Index(fields=['is_active', 'is_featured']),
             models.Index(fields=['category']),
+            models.Index(fields=['cost_price']),   # NEW — for profit aggregation queries
         ]
 
     def __str__(self):
         return self.name
 
     def save(self, *args, **kwargs):
+        # 1. Existing slug logic (UNCHANGED)
         if not self.slug:
             self.slug = slugify(self.name)
+
+        # 2. NEW — pricing logic (only runs when cost_price is provided)
+        if self.cost_price is not None:
+            if self.profit_margin is not None:
+                # Auto-derive selling price from cost + margin
+                self.price = round(
+                    self.cost_price + (self.cost_price * self.profit_margin / 100), 2
+                )
+            # Guard: selling price must never fall below cost price
+            if self.price < self.cost_price:
+                raise ValueError(
+                    f"price ({self.price}) cannot be less than cost_price ({self.cost_price})."
+                )
+
         super().save(*args, **kwargs)
 
     @property
@@ -85,6 +118,18 @@ class Product(models.Model):
     @property
     def review_count(self):
         return self.reviews.count()
+
+    # NEW ─────────────────────────────────────────────────────────────────────
+    @property
+    def profit(self):
+        """
+        Profit per unit (price − cost_price).
+        Returns None when cost_price is not set — fully backwards-compatible.
+        Not stored in the database; always computed on access.
+        """
+        if self.cost_price is not None:
+            return round(self.price - self.cost_price, 2)
+        return None
 
 
 class ProductImage(models.Model):
