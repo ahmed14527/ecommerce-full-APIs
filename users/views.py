@@ -1,29 +1,49 @@
-from rest_framework import generics, status, permissions
+"""
+apps/users/views.py
+
+Views are intentionally thin:
+  - Deserialize input
+  - Call service or serializer
+  - Serialize output
+  - Return response
+
+No business logic lives here.
+"""
+
+import logging
+
+from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.views import TokenObtainPairView
-from rest_framework_simplejwt.tokens import RefreshToken
-from drf_spectacular.utils import extend_schema, extend_schema_view
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from .models import Address
-from .serializers import (
+from users.serializers import (
     CustomTokenObtainPairSerializer,
+    GoogleAuthSerializer,
+    LoginSerializer,
+    LogoutSerializer,
+    PasswordChangeSerializer,
     RegisterSerializer,
     UserProfileSerializer,
-    ChangePasswordSerializer,
-    AddressSerializer,
+    UserUpdateSerializer,
 )
+from users.services.google_auth import GoogleTokenError, authenticate_google_user
+
+logger = logging.getLogger(__name__)
 
 
-@extend_schema(tags=['auth'])
-class CustomTokenObtainPairView(TokenObtainPairView):
-    """Login – returns access + refresh JWT tokens."""
-    serializer_class = CustomTokenObtainPairSerializer
+# ── Registration ──────────────────────────────────────────────────────────────
 
-
-@extend_schema(tags=['auth'])
 class RegisterView(generics.CreateAPIView):
-    """Register a new user account."""
+    """
+    POST /api/auth/register/
+
+    Creates a new email/password user and returns JWT tokens immediately
+    so the user doesn't need to log in after registering.
+
+    Permission: AllowAny (public endpoint)
+    """
+
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
 
@@ -31,75 +51,194 @@ class RegisterView(generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
+
+        # Issue tokens immediately — no need for a separate login step
+        from rest_framework_simplejwt.tokens import RefreshToken
         refresh = RefreshToken.for_user(user)
-        return Response({
-            'user': UserProfileSerializer(user).data,
-            'tokens': {
-                'access': str(refresh.access_token),
-                'refresh': str(refresh),
+
+        return Response(
+            {
+                "user": UserProfileSerializer(user).data,
+                "access": str(refresh.access_token),
+                "refresh": str(refresh),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+# ── Login ─────────────────────────────────────────────────────────────────────
+
+class LoginView(APIView):
+    """
+    POST /api/auth/login/
+
+    Email + password login. Returns JWT access + refresh tokens.
+    We use a custom serializer instead of SimpleJWT's TokenObtainPairView
+    so we can return the user profile alongside the tokens.
+
+    Permission: AllowAny (public endpoint)
+    """
+
+    permission_classes = [permissions.AllowAny]
+    serializer_class = LoginSerializer          # for drf-spectacular schema
+
+    def post(self, request):
+        serializer = LoginSerializer(
+            data=request.data,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        user = serializer.validated_data["user"]
+
+        from rest_framework_simplejwt.tokens import RefreshToken
+        refresh = RefreshToken.for_user(user)
+
+        return Response(
+            {
+                "user": UserProfileSerializer(user).data,
+                "access": str(refresh.access_token),
+                "refresh": str(refresh),
             }
-        }, status=status.HTTP_201_CREATED)
+        )
 
 
-@extend_schema(tags=['auth'])
+# ── Token refresh ─────────────────────────────────────────────────────────────
+
+class TokenRefreshView(TokenRefreshView):
+    """
+    POST /api/auth/token/refresh/
+
+    Standard SimpleJWT token refresh — inherits directly.
+    Separated here so we can add custom logic later (e.g. rotate + blacklist).
+    """
+
+
+# ── Logout ────────────────────────────────────────────────────────────────────
+
 class LogoutView(APIView):
-    """Blacklist the refresh token to log the user out."""
+    """
+    POST /api/auth/logout/
+
+    Blacklists the provided refresh token so it cannot be used again.
+    The access token expires naturally (keep ACCESS_TOKEN_LIFETIME short).
+
+    Body: { "refresh": "<refresh_token>" }
+
+    Permission: IsAuthenticated
+    """
+
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
+        serializer = LogoutSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            {"detail": "Successfully logged out."},
+            status=status.HTTP_200_OK,
+        )
+
+
+# ── Google OAuth ──────────────────────────────────────────────────────────────
+
+class GoogleAuthView(APIView):
+    """
+    POST /api/auth/google/
+
+    Accepts a Google ID token from the frontend, verifies it against
+    Google's public keys, and returns JWT tokens for our system.
+
+    Why this is safe:
+      - We NEVER trust the payload the frontend sends.
+      - The `google-auth` library verifies the token signature, audience
+        (CLIENT_ID), issuer, and expiry — none of which the frontend can fake.
+      - Token verification happens in the service layer, not here.
+
+    Body:    { "id_token": "<google_id_token>" }
+    Returns: { "access": "...", "refresh": "...", "created": bool, "user": {...} }
+
+    Permission: AllowAny (the Google token IS the credential)
+    """
+
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = GoogleAuthSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        raw_token = serializer.validated_data["id_token"]
+
         try:
-            refresh_token = request.data['refresh']
-            token = RefreshToken(refresh_token)
-            token.blacklist()
-            return Response({'detail': 'Successfully logged out.'}, status=status.HTTP_200_OK)
-        except Exception:
-            return Response({'detail': 'Invalid token.'}, status=status.HTTP_400_BAD_REQUEST)
+            result = authenticate_google_user(raw_token)
+        except GoogleTokenError as exc:
+            # Return 401 for token problems — do not expose internal details
+            logger.warning(
+                "Google auth failed for request from %s: %s",
+                request.META.get("REMOTE_ADDR"),
+                exc,
+            )
+            return Response(
+                {"detail": "Google authentication failed. Please try again."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        http_status = status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
+
+        return Response(
+            {
+                "user": UserProfileSerializer(result.user).data,
+                "access": result.access_token,
+                "refresh": result.refresh_token,
+                "created": result.created,
+            },
+            status=http_status,
+        )
 
 
-@extend_schema(tags=['users'])
-class UserProfileView(generics.RetrieveUpdateAPIView):
-    """Get or update the authenticated user's profile."""
-    serializer_class = UserProfileSerializer
+# ── Current user profile ──────────────────────────────────────────────────────
+
+class MeView(generics.RetrieveUpdateAPIView):
+    """
+    GET  /api/users/me/    — return current user profile
+    PATCH /api/users/me/   — update name / avatar_url
+
+    Permission: IsAuthenticated
+    """
+
     permission_classes = [permissions.IsAuthenticated]
 
-    def get_object(self):
-        return self.request.user
-
-
-@extend_schema(tags=['users'])
-class ChangePasswordView(generics.UpdateAPIView):
-    """Change the authenticated user's password."""
-    serializer_class = ChangePasswordSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    def get_serializer_class(self):
+        if self.request.method in ("PUT", "PATCH"):
+            return UserUpdateSerializer
+        return UserProfileSerializer
 
     def get_object(self):
         return self.request.user
 
     def update(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data, context={'request': request})
+        kwargs["partial"] = True          # always allow partial updates
+        return super().update(request, *args, **kwargs)
+
+
+# ── Password change ───────────────────────────────────────────────────────────
+
+class PasswordChangeView(APIView):
+    """
+    POST /api/users/me/change-password/
+
+    Requires current password — prevents account takeover if a session
+    token is stolen but the attacker doesn't know the password.
+
+    Permission: IsAuthenticated
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = PasswordChangeSerializer(
+            data=request.data,
+            context={"request": request},
+        )
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        return Response({'detail': 'Password updated successfully.'})
-
-
-@extend_schema(tags=['users'])
-class AddressListCreateView(generics.ListCreateAPIView):
-    """List or create addresses for the current user."""
-    serializer_class = AddressSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return Address.objects.filter(user=self.request.user)
-
-    def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
-
-
-@extend_schema(tags=['users'])
-class AddressDetailView(generics.RetrieveUpdateDestroyAPIView):
-    """Retrieve, update, or delete a single address."""
-    serializer_class = AddressSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return Address.objects.filter(user=self.request.user)
+        return Response({"detail": "Password updated successfully."})
